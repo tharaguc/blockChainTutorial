@@ -1,16 +1,71 @@
 import hashlib
-from importlib.metadata import requires
 import json
 from time import time
-from textwrap import dedent
 from uuid import uuid4
+from urllib.parse import urlparse
+import requests
 from flask import Flask, jsonify, request
 
 class BlochChain (object):
 	def __init__(self):
 		self.chain = []
+		self.nodes = set()
 		self.current_transactions = []
 		self.newBlock(previous_hash=1, proof=100)
+
+	def resister_node(self, adress):
+		parsedURL = urlparse(adress)
+
+		if parsedURL.netloc:
+			self.nodes.add(parsedURL.netloc)
+		elif parsedURL.path:
+			self.nodes.add(parsedURL.path)
+		else:
+			raise ValueError('Invalid URL')
+
+	def valid_chain(self, chain):
+		lastBlock = chain[0]
+		currentIndex = 1
+
+		while currentIndex < len(chain):
+			block = chain[currentIndex]
+			print(f'{lastBlock}')
+			print(f'{block}')
+			print("=============")
+
+			lastBlockHash = self.hash(lastBlock)
+			if block['previous_hash'] != lastBlockHash:
+				return False
+			if not self.valid_proof(lastBlock['proof'], block['proof'], lastBlockHash):
+				return False
+			
+			lastBlock = block
+			currentIndex += 1
+		
+		return True
+
+	def resolve_conflicts(self):
+		neighbours = self.nodes
+		newChain = None
+
+		maxLength = len(self.chain)
+
+		for node in neighbours:
+			response = requests.get(f'http://{node}/chain')
+
+			if response.status_code == 200:
+				length = response.json()['length']
+				chain = response.json()['chain']
+				if length > maxLength and self.valid_chain(chain):
+					maxLength = length
+					newChain = chain
+		
+		if newChain:
+			self.chain = newChain
+			return True
+		
+		return False
+
 
 	def newBlock(self, proof, previous_hash=None):
 		block = {
@@ -39,19 +94,19 @@ class BlochChain (object):
 		return proof
 
 	@staticmethod
-	def valid_proof(lastProof, proof):
-		guess = f'{lastProof}{proof}'.encode()
+	def valid_proof(lastProof, proof, lastHash):
+		guess = f'{lastProof}{proof}{lastHash}'.encode()
 		guessHash = hashlib.sha256(guess).hexdigest()
 		return guessHash[:4] == "0000"
 
 	@staticmethod
 	def hash(block):
-		block_string = json.dumps(block, sort_keys=True)
+		block_string = json.dumps(block, sort_keys=True).encode()
 		return hashlib.sha256(block_string).hexdigest()
 
 	@property
 	def lastBlock(self):
-		pass
+		return self.chain[-1]
 
 #---------------------#
 
@@ -78,11 +133,26 @@ def new_transactions():
 @app.route('/mine', methods=['GET'])
 def mine():
 	lastBlock = blockChain.lastBlock
-	lastProof = lastBlock['proof']
-	proof = blockChain.proof_of_work(lastProof)
+	proof = blockChain.proof_of_work(lastBlock)
 
-	blockChain.new_transaction()
-	return 'Mine a new block.'
+	blockChain.new_transaction(
+		sender="0",
+		recipient=node_identifier,
+		amount=1,
+	)
+
+	previous_hash = blockChain.hash(lastBlock)
+	block = blockChain.newBlock(proof, previous_hash)
+
+	res = {
+		'message': '新しいブロックを採掘しました',
+		'index': block['index'],
+		'transactions': block['transactions'],
+		'proof': block['proof'],
+		'previous_hash': block['previous_hash'],
+	}
+
+	return jsonify(res), 200
 
 @app.route('/chain', methods=['GET'])
 def fullChain():
@@ -92,5 +162,41 @@ def fullChain():
 	}
 	return jsonify(res), 200
 
+@app.route('/nodes/register', methods=['POST'])
+def node_register():
+	print("err")
+	values = request.get_json()
+
+	nodes = values.get('nodes')
+	if nodes is None:
+		return "Error: 無効なノードリストです", 400
+	
+	for node in nodes:
+		blockChain.resister_node(node)
+
+	res = {
+		'message': 'ノードが追加されました',
+		'chain': blockChain.chain
+	}
+	return jsonify(res), 200
+
+@app.route('/nodes/resolve', methods=['GET'])
+def consensus():
+	replaced = blockChain.resolve_conflicts()
+
+	if replaced:
+		res = {
+			'message': 'チェーンが置き換えられました',
+			'chain': blockChain.chain
+		}
+	else:
+		res = {
+			'message': 'チェーンが確認されました',
+			'chain': blockChain.chain
+		}
+
+	return jsonify(res), 200
+
+
 if __name__ == '__main__':
-	app.run(host='0.0.0.0', port=5000)
+	app.run(host='0.0.0.0', port=3001)
